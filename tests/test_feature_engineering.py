@@ -60,12 +60,12 @@ class TestFeatureEngineer:
         
         # Check that mean is close to 0 and std is close to 1
         assert abs(train_scaled['numeric_col'].mean()) < 0.1
-        assert abs(train_scaled['numeric_col'].std() - 1.0) < 0.1
+        assert abs(train_scaled['numeric_col'].std(ddof=0) - 1.0) < 0.1
     
     def test_create_time_features(self):
         """Test time feature creation."""
         df = pd.DataFrame({
-            'timestamp': pd.date_range('2024-01-01', periods=5, freq='H')
+            'timestamp': pd.date_range('2024-01-01', periods=5, freq='h')
         })
         
         engineer = FeatureEngineer()

@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# Testing
+pytest==8.3.4
+
+# Notebooks
+ipykernel==6.29.5

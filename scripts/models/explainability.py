@@ -13,6 +13,23 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _fraud_class(values, expected_value=None):
+    """
+    Select the fraud-class (class 1) SHAP values.
+    
+    Older SHAP returns a list [class_0, class_1]; SHAP >= 0.45 returns an array
+    of shape (n_samples, n_features, n_classes) for binary classifiers.
+    """
+    if isinstance(values, list):
+        values = values[1]
+    elif isinstance(values, np.ndarray) and values.ndim == 3:
+        values = values[:, :, 1]
+    
+    if expected_value is not None and np.ndim(expected_value) > 0:
+        expected_value = np.asarray(expected_value)[-1]
+    return values, expected_value
+
+
 class ModelExplainer:
     """Provide model explanations using SHAP and LIME."""
     
@@ -113,11 +130,7 @@ class ModelExplainer:
             logger.info(f"Calculating SHAP values for {len(X_explain)} instances...")
             shap_values = self.shap_explainer.shap_values(X_explain)
             
-            # Handle multi-output (classification) case
-            if isinstance(shap_values, list) and len(shap_values) == 2:
-                shap_values_fraud = shap_values[1]  # Fraud class
-            else:
-                shap_values_fraud = shap_values
+            shap_values_fraud, base_value = _fraud_class(shap_values, self.shap_explainer.expected_value)
             
             # Generate plot
             if plot_type == 'summary':
@@ -129,20 +142,12 @@ class ModelExplainer:
                 
             elif plot_type == 'waterfall' and len(X_explain) > 0:
                 plt.figure(figsize=(10, 8))
-                if isinstance(shap_values, list):
-                    shap.waterfall_plot(shap.Explanation(
-                        values=shap_values[1][0],
-                        base_values=self.shap_explainer.expected_value[1] if isinstance(self.shap_explainer.expected_value, list) else self.shap_explainer.expected_value,
-                        data=X_explain.iloc[0].values,
-                        feature_names=self.feature_names
-                    ), max_display=max_display, show=False)
-                else:
-                    shap.waterfall_plot(shap.Explanation(
-                        values=shap_values[0],
-                        base_values=self.shap_explainer.expected_value,
-                        data=X_explain.iloc[0].values,
-                        feature_names=self.feature_names
-                    ), max_display=max_display, show=False)
+                shap.waterfall_plot(shap.Explanation(
+                    values=shap_values_fraud[0],
+                    base_values=base_value,
+                    data=X_explain.iloc[0].values,
+                    feature_names=self.feature_names
+                ), max_display=max_display, show=False)
                 plt.tight_layout()
                 
             elif plot_type == 'bar':
@@ -245,11 +250,7 @@ class ModelExplainer:
                 logger.error("SHAP explainer not available")
                 return None
             
-            shap_values = self.shap_explainer.shap_values(X_sample)
-
-            # Handle multi-output case
-            if isinstance(shap_values, list):
-                shap_values = shap_values[1]  # Fraud class
+            shap_values, _ = _fraud_class(self.shap_explainer.shap_values(X_sample))
 
             # Calculate mean absolute SHAP values
             importance = np.abs(shap_values).mean(axis=0)

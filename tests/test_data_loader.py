@@ -77,8 +77,8 @@ class TestDataLoader:
             'Class': [0, 0, 1]
         })
         
-        fraud_data.to_csv(tmp_path / 'cleaned_data_1.csv', index=False)
-        credit_data.to_csv(tmp_path / 'cleaned_data_2.csv', index=False)
+        fraud_data.to_csv(tmp_path / 'fraud_data_combined.csv', index=False)
+        credit_data.to_csv(tmp_path / 'credit_cleaned_data_2.csv', index=False)
         
         return tmp_path
     
@@ -123,8 +123,8 @@ def test_load_datasets_function(tmp_path):
         'Class': [0, 0, 1]
     })
     
-    fraud_data.to_csv(tmp_path / 'cleaned_data_1.csv', index=False)
-    credit_data.to_csv(tmp_path / 'cleaned_data_2.csv', index=False)
+    fraud_data.to_csv(tmp_path / 'fraud_data_combined.csv', index=False)
+    credit_data.to_csv(tmp_path / 'credit_cleaned_data_2.csv', index=False)
     
     datasets = load_datasets(data_dir=str(tmp_path), validate=False)
     

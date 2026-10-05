@@ -20,6 +20,10 @@ class FeatureEngineer:
         self.label_encoders = {}
         self.imputer = SimpleImputer(strategy='median')
         self.feature_names = None
+        # State recorded by prepare_features so transform() can replay it on new data
+        self.onehot_columns = []
+        self.numeric_fill_values = {}
+        self.is_scaled = False
         
     def handle_missing_values(self, df: pd.DataFrame, strategy: str = 'median') -> pd.DataFrame:
         """
@@ -40,11 +44,11 @@ class FeatureEngineer:
             self.imputer = SimpleImputer(strategy=strategy)
             df_copy[numeric_cols] = self.imputer.fit_transform(df_copy[numeric_cols])
       
-        categorical_cols = df_copy.select_dtypes(include=['object']).columns
+        categorical_cols = df_copy.select_dtypes(include=['object', 'category']).columns
         for col in categorical_cols:
             if df_copy[col].isnull().sum() > 0:
-                df_copy[col].fillna(df_copy[col].mode()[0] if len(df_copy[col].mode()) > 0 else 'Unknown', 
-                                   inplace=True)
+                mode = df_copy[col].mode()
+                df_copy[col] = df_copy[col].fillna(mode[0] if len(mode) > 0 else 'Unknown')
         
         return df_copy
     
@@ -64,7 +68,7 @@ class FeatureEngineer:
         X_train_copy = X_train.copy()
         X_test_copy = X_test.copy() if X_test is not None else None
         
-        categorical_cols = X_train_copy.select_dtypes(include=['object']).columns
+        categorical_cols = X_train_copy.select_dtypes(include=['object', 'category']).columns
         
         if len(categorical_cols) == 0:
             logger.info("No categorical columns found")
@@ -85,9 +89,10 @@ class FeatureEngineer:
             if use_onehot:
                 
                 logger.info(f"  - {col}: One-hot encoding ({n_unique} unique values)")
-                X_train_copy = pd.get_dummies(X_train_copy, columns=[col], drop_first=True, prefix=col)
+                self.onehot_columns.append(col)
+                X_train_copy = pd.get_dummies(X_train_copy, columns=[col], drop_first=True, prefix=col, dtype=int)
                 if X_test_copy is not None:
-                    X_test_copy = pd.get_dummies(X_test_copy, columns=[col], drop_first=True, prefix=col)
+                    X_test_copy = pd.get_dummies(X_test_copy, columns=[col], drop_first=True, prefix=col, dtype=int)
                     
                     missing_cols = set(X_train_copy.columns) - set(X_test_copy.columns)
                     for c in missing_cols:
@@ -198,13 +203,18 @@ class FeatureEngineer:
         
         logger.info("Creating transaction velocity features")
         
-       
+        if not pd.api.types.is_datetime64_any_dtype(df_copy[time_col]):
+            df_copy[time_col] = pd.to_datetime(df_copy[time_col])
+        
+        # Remember the input order so the result lines up with the caller's rows
+        df_copy['_row_order'] = np.arange(len(df_copy))
         df_copy = df_copy.sort_values([user_col, time_col])
         
         df_copy['user_transaction_count'] = df_copy.groupby(user_col).cumcount() + 1
         
-        df_copy['time_since_last_transaction'] = df_copy.groupby(user_col)[time_col].diff().dt.total_seconds()
-        df_copy['time_since_last_transaction'].fillna(0, inplace=True)
+        df_copy['time_since_last_transaction'] = (
+            df_copy.groupby(user_col)[time_col].diff().dt.total_seconds().fillna(0)
+        )
         
       
         df_copy['transaction_frequency'] = df_copy.groupby(user_col)[user_col].transform('count')
@@ -218,7 +228,98 @@ class FeatureEngineer:
             
             df_copy['amount_deviation'] = (df_copy[amount_col] - df_copy['user_avg_amount']) / (df_copy['user_std_amount'] + 1e-6)
         
+        df_copy = df_copy.sort_values('_row_order').drop(columns='_row_order')
+        
         logger.info("Created velocity features: user_transaction_count, time_since_last_transaction, transaction_frequency")
+        
+        return df_copy
+    
+    @staticmethod
+    def convert_ip_to_int(ip) -> float:
+        """
+        Convert an IP address to an integer.
+        
+        Accepts dotted-quad strings ('192.168.0.1') or numeric values (the raw
+        dataset stores IPs as floats). Returns NaN for missing/unparseable values.
+        """
+        if pd.isnull(ip):
+            return np.nan
+        if isinstance(ip, str) and '.' in ip and ip.count('.') == 3:
+            try:
+                a, b, c, d = (int(part) for part in ip.split('.'))
+                return (a << 24) + (b << 16) + (c << 8) + d
+            except ValueError:
+                return np.nan
+        try:
+            return int(float(ip))
+        except (TypeError, ValueError):
+            return np.nan
+    
+    def prepare_ip_country_ranges(self, ip_country_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Clean the IP-to-country table for range lookups.
+        
+        Args:
+            ip_country_df: IP-to-country mapping dataframe
+            
+        Returns:
+            DataFrame with integer bounds, sorted by lower bound
+        """
+        ranges = ip_country_df.copy()
+        for col in ['lower_bound_ip_address', 'upper_bound_ip_address']:
+            ranges[col] = ranges[col].apply(self.convert_ip_to_int)
+        ranges = ranges.dropna(subset=['lower_bound_ip_address', 'upper_bound_ip_address'])
+        ranges[['lower_bound_ip_address', 'upper_bound_ip_address']] = (
+            ranges[['lower_bound_ip_address', 'upper_bound_ip_address']].astype('int64')
+        )
+        return ranges.sort_values('lower_bound_ip_address').reset_index(drop=True)
+    
+    def merge_ip_country_range(self, df: pd.DataFrame, ip_country_df: pd.DataFrame,
+                               ip_col: str = 'ip_address',
+                               unknown_label: str = 'Unknown') -> pd.DataFrame:
+        """
+        Add a 'country' column by finding the IP range each address falls into.
+        
+        Args:
+            df: Main dataframe
+            ip_country_df: IP-to-country mapping dataframe
+            ip_col: Column name for IP address
+            unknown_label: Country assigned to IPs that match no range
+            
+        Returns:
+            DataFrame with a 'country' column, in the original row order
+        """
+        df_copy = df.copy()
+        
+        if ip_col not in df_copy.columns:
+            logger.warning(f"IP column '{ip_col}' not found")
+            return df_copy
+        
+        logger.info("Merging IP addresses with country ranges")
+        
+        ranges = self.prepare_ip_country_ranges(ip_country_df)
+        
+        lookup = pd.DataFrame({
+            '_row_order': np.arange(len(df_copy)),
+            '_ip_int': df_copy[ip_col].apply(self.convert_ip_to_int),
+        })
+        valid = lookup.dropna(subset=['_ip_int']).astype({'_ip_int': 'int64'}).sort_values('_ip_int')
+        
+        matched = pd.merge_asof(
+            valid, ranges,
+            left_on='_ip_int', right_on='lower_bound_ip_address',
+            direction='backward'
+        )
+        in_range = matched['_ip_int'] <= matched['upper_bound_ip_address']
+        matched.loc[~in_range, 'country'] = np.nan
+        
+        country = pd.Series(np.nan, index=np.arange(len(df_copy)), dtype=object)
+        country.loc[matched['_row_order'].values] = matched['country'].values
+        df_copy['country'] = country.fillna(unknown_label).values
+        
+        n_unknown = (df_copy['country'] == unknown_label).sum()
+        logger.info(f"Matched {len(df_copy) - n_unknown}/{len(df_copy)} IPs to a country "
+                    f"({n_unknown} labelled '{unknown_label}')")
         
         return df_copy
     
@@ -235,23 +336,87 @@ class FeatureEngineer:
         Returns:
             DataFrame with geolocation features
         """
+        return self.merge_ip_country_range(df, ip_country_df, ip_col=ip_col)
+    
+    def remove_duplicates(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Drop exact duplicate rows."""
+        n_before = len(df)
+        df_clean = df.drop_duplicates().reset_index(drop=True)
+        logger.info(f"Removed {n_before - len(df_clean)} duplicate rows")
+        return df_clean
+    
+    def coerce_dtypes(self, df: pd.DataFrame,
+                      datetime_cols: Optional[List[str]] = None,
+                      categorical_cols: Optional[List[str]] = None,
+                      numeric_cols: Optional[List[str]] = None) -> pd.DataFrame:
+        """
+        Cast columns to datetime, category or numeric dtypes.
+        
+        Columns that are not present are skipped.
+        """
         df_copy = df.copy()
-        
-        if ip_col not in df_copy.columns:
-            logger.warning(f"IP column '{ip_col}' not found")
-            return df_copy
-        
-        logger.info("Creating geolocation features")
-        
-        df_copy = df_copy.merge(ip_country_df, left_on=ip_col, right_on='lower_bound_ip_address', how='left')
-        
-        if 'class' in df_copy.columns:
-            country_fraud_rate = df_copy.groupby('country')['class'].mean()
-            df_copy['country_fraud_rate'] = df_copy['country'].map(country_fraud_rate)
-        
-        logger.info("Created geolocation features")
-        
+        for col in datetime_cols or []:
+            if col in df_copy.columns:
+                df_copy[col] = pd.to_datetime(df_copy[col], errors='coerce')
+        for col in categorical_cols or []:
+            if col in df_copy.columns:
+                df_copy[col] = df_copy[col].astype('category')
+        for col in numeric_cols or []:
+            if col in df_copy.columns:
+                df_copy[col] = pd.to_numeric(df_copy[col], errors='coerce')
         return df_copy
+    
+    def scale_numeric_columns(self, df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+        """Standard-scale the given columns in place of the originals."""
+        df_copy = df.copy()
+        columns = [c for c in columns if c in df_copy.columns]
+        if columns:
+            df_copy[columns] = StandardScaler().fit_transform(df_copy[columns])
+        return df_copy
+    
+    def plot_univariate(self, df: pd.DataFrame,
+                        numeric_cols: Optional[List[str]] = None,
+                        categorical_cols: Optional[List[str]] = None):
+        """Plot histograms for numeric columns and counts for categorical columns."""
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
+        for col in numeric_cols or []:
+            plt.figure(figsize=(8, 4))
+            sns.histplot(df[col], bins=50, kde=True)
+            plt.title(f'Distribution of {col}')
+            plt.tight_layout()
+            plt.show()
+        
+        for col in categorical_cols or []:
+            plt.figure(figsize=(8, 4))
+            sns.countplot(x=col, data=df, order=df[col].value_counts().index)
+            plt.title(f'Counts of {col}')
+            plt.tight_layout()
+            plt.show()
+    
+    def plot_bivariate(self, df: pd.DataFrame, target_col: str,
+                       numeric_cols: Optional[List[str]] = None,
+                       categorical_cols: Optional[List[str]] = None):
+        """Plot numeric columns and categorical fraud rates against the target."""
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
+        for col in numeric_cols or []:
+            plt.figure(figsize=(8, 4))
+            sns.boxplot(x=target_col, y=col, data=df)
+            plt.title(f'{col} by {target_col}')
+            plt.tight_layout()
+            plt.show()
+        
+        for col in categorical_cols or []:
+            rates = df.groupby(col, observed=True)[target_col].mean().sort_values(ascending=False)
+            plt.figure(figsize=(8, 4))
+            sns.barplot(x=rates.index.astype(str), y=rates.values)
+            plt.title(f'Fraud rate by {col}')
+            plt.ylabel(f'mean {target_col}')
+            plt.tight_layout()
+            plt.show()
     
     def prepare_features(self, X_train: pd.DataFrame, X_test: pd.DataFrame = None,
                         scale: bool = True, 
@@ -270,7 +435,10 @@ class FeatureEngineer:
         """
         logger.info("Starting feature preparation pipeline")
         
-    
+        self.onehot_columns = []
+        self.label_encoders = {}
+        self.numeric_fill_values = X_train.select_dtypes(include=[np.number]).median().to_dict()
+        
         X_train = self.handle_missing_values(X_train)
         if X_test is not None:
             X_test = self.handle_missing_values(X_test)
@@ -282,11 +450,61 @@ class FeatureEngineer:
         
         if scale:
             X_train, X_test = self.scale_features(X_train, X_test)
+        self.is_scaled = scale
         
         self.feature_names = X_train.columns.tolist()
         logger.info(f"Feature preparation complete. Final shape: {X_train.shape}")
         
         return X_train, X_test
+    
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply the preprocessing fitted by prepare_features to new data.
+        
+        Unseen categories are label-encoded as -1 (or get no one-hot column),
+        missing numeric values are filled with the training medians, and the
+        output has exactly the training columns in the training order.
+        
+        Args:
+            X: Features with the same raw columns passed to prepare_features
+            
+        Returns:
+            DataFrame ready for the model
+        """
+        if self.feature_names is None:
+            raise RuntimeError("FeatureEngineer is not fitted; call prepare_features first")
+        
+        X = X.copy()
+        
+        for col, value in self.numeric_fill_values.items():
+            if col in X.columns:
+                X[col] = pd.to_numeric(X[col], errors='coerce').fillna(value)
+        
+        for col, le in self.label_encoders.items():
+            if col in X.columns:
+                known = set(le.classes_)
+                X[col] = X[col].astype(str).map(
+                    lambda v: le.transform([v])[0] if v in known else -1
+                )
+        
+        onehot = [c for c in self.onehot_columns if c in X.columns]
+        if onehot:
+            X = pd.get_dummies(X, columns=onehot, prefix=onehot, dtype=int)
+        
+        X = X.reindex(columns=self.feature_names, fill_value=0)
+        
+        if self.is_scaled:
+            X = pd.DataFrame(self.scaler.transform(X), columns=X.columns, index=X.index)
+        
+        return X
+
+
+# Identifiers, raw timestamps and intermediate columns that must not reach the model
+FRAUD_DROP_COLUMNS = [
+    'user_id', 'device_id', 'signup_time', 'purchase_time',
+    'ip_address', 'ip_address_int', 'lower_bound_ip_address', 'upper_bound_ip_address',
+    'hour', 'day_of_month', 'month', 'is_weekend', 'time_of_day', 'user_transaction_count',
+]
 
 
 def prepare_fraud_data(fraud_df: pd.DataFrame, 
@@ -294,6 +512,11 @@ def prepare_fraud_data(fraud_df: pd.DataFrame,
                        ip_country_df: pd.DataFrame = None) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Prepare fraud dataset for modeling.
+    
+    Adds country (from ip_country_df, unless a 'country' column already exists),
+    hour_of_day, day_of_week, transaction_count (transactions per device),
+    time_since_last_transaction and signup_purchase_diff, then drops identifiers
+    and raw timestamps.
     
     Args:
         fraud_df: Fraud dataframe
@@ -304,10 +527,34 @@ def prepare_fraud_data(fraud_df: pd.DataFrame,
         Tuple of (X, y)
     """
     df = fraud_df.copy()
+    engineer = FeatureEngineer()
     
+    for col in ['signup_time', 'purchase_time']:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col])
+    
+    if 'country' not in df.columns:
+        if ip_country_df is not None:
+            df = engineer.merge_ip_country_range(df, ip_country_df)
+        elif 'ip_address' in df.columns:
+            logger.warning("No ip_country_df given and no 'country' column; skipping country feature")
+    
+    if 'purchase_time' in df.columns:
+        df = engineer.create_time_features(df, 'purchase_time')
+        df['hour_of_day'] = df['hour']
+        
+        # user_id is unique per row in this dataset, so velocity is measured per device
+        if 'device_id' in df.columns:
+            df = engineer.create_transaction_velocity_features(
+                df, user_col='device_id', time_col='purchase_time'
+            )
+            df = df.rename(columns={'transaction_frequency': 'transaction_count'})
+        
+        if 'signup_time' in df.columns:
+            df['signup_purchase_diff'] = (df['purchase_time'] - df['signup_time']).dt.total_seconds()
     
     y = df[target_col]
-    X = df.drop(columns=[target_col])
+    X = df.drop(columns=[target_col] + FRAUD_DROP_COLUMNS, errors='ignore')
     
     return X, y
 
@@ -339,8 +586,9 @@ if __name__ == "__main__":
     
     loader = DataLoader()
     fraud_data = loader.load_fraud_data(validate=False)
+    ip_country = None if 'country' in fraud_data.columns else loader.load_ip_country_data()
     
-    X, y = prepare_fraud_data(fraud_data)
+    X, y = prepare_fraud_data(fraud_data, ip_country_df=ip_country)
     
     from sklearn.model_selection import train_test_split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)

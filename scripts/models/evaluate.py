@@ -233,6 +233,8 @@ class ModelEvaluator:
             Dictionary with optimal threshold and metrics
         """
         precisions, recalls, thresholds = precision_recall_curve(y_true, y_pred_proba)
+        # The last precision/recall pair (1, 0) has no threshold; drop it so indices line up
+        precisions, recalls = precisions[:-1], recalls[:-1]
         
         # Calculate F1 scores for each threshold
         f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
@@ -255,6 +257,8 @@ class ModelEvaluator:
         elif metric == 'youden':
             # Youden's J statistic = sensitivity + specificity - 1
             fpr, tpr, roc_thresholds = roc_curve(y_true, y_pred_proba)
+            # The first ROC point uses threshold=inf (predict nothing); skip it
+            fpr, tpr, roc_thresholds = fpr[1:], tpr[1:], roc_thresholds[1:]
             j_scores = tpr - fpr
             optimal_idx = np.argmax(j_scores)
             optimal_threshold = roc_thresholds[optimal_idx]
@@ -301,6 +305,8 @@ class ModelEvaluator:
             Dictionary with threshold and metrics
         """
         precisions, recalls, thresholds = precision_recall_curve(y_true, y_pred_proba)
+        # The last precision/recall pair (1, 0) has no threshold; drop it so indices line up
+        precisions, recalls = precisions[:-1], recalls[:-1]
         
         # Find threshold that achieves target precision
         valid_indices = precisions >= target_precision
